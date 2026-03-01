@@ -31,4 +31,8 @@ celery_app.conf.beat_schedule = {
         'task': 'api.celery_tasks.process_outbox_events',
         'schedule': 5.0, # Execute every 5 seconds
     },
+    'morning-prewarming-task': {
+        'task': 'api.celery_tasks.morning_prewarming_orchestrator',
+        'schedule': 900.0, # Execute every 15 minutes to catch time zone windows
+    },
 }

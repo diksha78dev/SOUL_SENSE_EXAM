@@ -365,3 +365,57 @@ def gdpr_scrub_worker_task():
 
     return run_async(_execute_purge())
 
+@celery_app.task(name="api.celery_tasks.morning_prewarming_orchestrator")
+def morning_prewarming_orchestrator():
+    """
+    Identifies active users based on their local time zone and schedules 
+    pre-calc for their smart prompts 30 mins before 8 AM local (#1177).
+    """
+    return run_async(_orchestrate_prewarming())
+
+async def _orchestrate_prewarming():
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        # Fallback for Python < 3.9 if needed
+        import pytz
+        def ZoneInfo(tz): return pytz.timezone(tz)
+    
+    async with AsyncSessionLocal() as db:
+        from api.models import User, UserSettings
+        # 1. Fetch all active users with their settings
+        from sqlalchemy import select
+        stmt = select(User.id, UserSettings.timezone).join(UserSettings).filter(User.is_active == True)
+        result = await db.execute(stmt)
+        user_data = result.all()
+        
+        count = 0
+        for user_id, tz_name in user_data:
+            try:
+                # 2. Get local time for user
+                tz = ZoneInfo(tz_name or "UTC")
+                local_now = datetime.now(tz)
+                
+                # 3. Check if it's 7:30 AM local time (the "Predictive" window)
+                # We check a 15-min window since this orchestrator runs every 15 mins
+                if local_now.hour == 7 and 30 <= local_now.minute < 45:
+                    prewarm_user_prompts_task.delay(user_id)
+                    count += 1
+            except Exception as e:
+                logger.error(f"Failed to check prewarm window for user {user_id}: {e}")
+        
+        logger.info(f"[Pre-warm] Orchestration complete. Scheduled {count} users.")
+        return count
+
+@celery_app.task(name="api.celery_tasks.prewarm_user_prompts_task")
+def prewarm_user_prompts_task(user_id: int):
+    """Calculates and caches the personalized smart prompts asynchronously."""
+    return run_async(_execute_prewarm(user_id))
+
+async def _execute_prewarm(user_id: int):
+    from api.services.smart_prompt_service import SmartPromptService
+    async with AsyncSessionLocal() as db:
+        service = SmartPromptService(db)
+        await service.prewarm_for_user(user_id)
+

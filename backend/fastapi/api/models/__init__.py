@@ -419,6 +419,7 @@ class UserSettings(Base):
     sound_enabled = Column(Boolean, default=True)
     notifications_enabled = Column(Boolean, default=True)
     language = Column(String, default="en")
+    timezone = Column(String, default="UTC", nullable=False) # Supporting Issue #1177: Time-zone-aware pre-warming
     
     # Crisis support settings (Integration with emotional support features)
     crisis_support_preference = Column(Boolean, default=True)
