@@ -88,6 +88,30 @@ async def check_redis(request) -> ServiceStatus:
         return ServiceStatus(status="unhealthy", message=str(e), latency_ms=None)
 
 
+async def check_clock_skew(request) -> ServiceStatus:
+    """Check clock synchronization status for distributed lock TTL protection (#1195)."""
+    try:
+        from clock_skew_monitor import get_clock_monitor
+        monitor = get_clock_monitor()
+        metrics = monitor.get_clock_metrics()
+
+        # Determine status based on clock state
+        if metrics.state.value == "synchronized":
+            status = "healthy"
+            message = f"Clock synchronized (offset: {metrics.ntp_offset:.3f}s)"
+        elif metrics.state.value == "drifting":
+            status = "degraded"
+            message = f"Clock drifting (offset: {metrics.ntp_offset:.3f}s, rate: {metrics.drift_rate:.6f})"
+        else:  # unsynchronized
+            status = "unhealthy"
+            message = f"Clock unsynchronized - using drift-tolerant timing"
+
+        return ServiceStatus(status=status, latency_ms=None, message=message)
+    except Exception as e:
+        logger.warning(f"Clock skew health check failed: {e}")
+        return ServiceStatus(status="unhealthy", message=f"Clock monitoring unavailable: {str(e)}", latency_ms=None)
+
+
 async def check_event_loop_health(request) -> ServiceStatus:
     """Check event loop health and FD resource status (#1183)."""
     try:
@@ -163,11 +187,13 @@ async def health_check(
     db_status = await check_database(db)
     redis_status = await check_redis(request)
     event_loop_status = await check_event_loop_health(request)
+    clock_skew_status = await check_clock_skew(request)
 
     services = {
         "database": db_status,
         "redis": redis_status,
-        "event_loop": event_loop_status
+        "event_loop": event_loop_status,
+        "clock_skew": clock_skew_status
     }
 
     # Determine overall health - all critical services must be healthy

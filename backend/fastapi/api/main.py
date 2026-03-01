@@ -77,6 +77,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"FD monitoring initialization failed: {e}")
         print(f"[WARNING] FD monitoring not available: {e}")
+
+    # Initialize Clock Skew Monitor (#1195)
+    try:
+        from clock_skew_monitor import init_clock_monitoring
+        await init_clock_monitoring()
+        print("[OK] Clock Skew Monitor initialized for distributed lock TTL protection")
+    except Exception as e:
+        logger.warning(f"Clock skew monitoring initialization failed: {e}")
+        print(f"[WARNING] Clock skew monitoring not available: {e}")
     
     # Initialize database tables
     try:
@@ -224,6 +233,14 @@ async def lifespan(app: FastAPI):
         await app.state.fd_monitor.health_monitor.stop_monitoring()
         app.state.fd_monitor.fd_manager.shutdown()
         logger.info("FD monitoring shutdown successfully")
+
+    # Stop Clock Skew Monitor (#1195)
+    try:
+        from clock_skew_monitor import shutdown_clock_monitoring
+        await shutdown_clock_monitoring()
+        logger.info("Clock skew monitoring shutdown successfully")
+    except Exception as e:
+        logger.warning(f"Clock skew monitoring shutdown failed: {e}")
     
     # Cancel background tasks
     if hasattr(app.state, 'purge_task'):
