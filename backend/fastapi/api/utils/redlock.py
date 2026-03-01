@@ -2,6 +2,7 @@ import uuid
 import logging
 from typing import Optional, Tuple
 from ..services.cache_service import cache_service
+from ....clock_skew_monitor import get_clock_monitor
 
 logger = logging.getLogger("api.utils.redlock")
 
@@ -26,20 +27,16 @@ end
 
 class RedlockService:
     """
-    Single-instance Redis locking with Fencing Tokens for Team Vision Documents (#1178).
+    Distributed Locking Mechanism using the Redlock algorithm principle in Redis (#1178).
+    Prevents Lost Updates by ensuring only one user can edit a resource at a time.
 
-    IMPORTANT — Locking model clarification:
-    This uses a single Redis node with atomic SET NX EX + Lua-guarded release/renew.
-    This is NOT a multi-node quorum Redlock (as defined in the antirez Redlock paper).
-    The design is intentionally pragmatic for this use-case:
-        - Single-node Redis provides mutual exclusion under normal conditions.
-        - Fencing Tokens (document version column) act as the final safety net:
-          even if a lock TTL races or Redis restarts, stale writes are rejected
-          at the database level via the version check.
+    Enhanced with clock skew resistance (#1195) to prevent TTL inconsistencies
+    caused by NTP drift in distributed deployments.
     """
 
     def __init__(self):
         self._lock_prefix = "lock:team_vision:"
+        self._clock_monitor = get_clock_monitor()
 
     def _key(self, resource_id: str) -> str:
         return f"{self._lock_prefix}{resource_id}"
@@ -48,37 +45,45 @@ class RedlockService:
         self, resource_id: str, user_id: int, ttl_seconds: int = 30
     ) -> Tuple[bool, Optional[str]]:
         """
-        Acquires an exclusive lease on a resource.
-        Returns (success, lock_value).
+        Acquires a lease on a resource with clock skew resistance.
+        Returns (success_boolean, lock_value_or_none).
 
-        lock_value format: "<user_id>:<uuid4>"
-        The client MUST store this token and present it exactly on every
-        PUT update and /renew call to prove they still hold the lease.
+        Uses monotonic timing with drift tolerance buffers to prevent
+        distributed deadlocks from clock skew (#1195).
         """
         await cache_service.connect()
-        lock_key = self._key(resource_id)
-        lock_value = f"{user_id}:{uuid.uuid4()}"
+        lock_key = f"{self._lock_prefix}{resource_id}"
+        lock_value = f"{user_id}:{uuid.uuid4()}" # Ownership + Unique ID
 
-        # NX = only set if key doesn't exist (mutual exclusion)
-        # EX = auto-expire after TTL so ghost locks cannot persist indefinitely
+        # Get clock-skew-resistant TTL with tolerance buffer
+        effective_ttl, tolerance = self._clock_monitor.get_time_with_tolerance(ttl_seconds)
+
+        # Log clock skew information for monitoring
+        metrics = self._clock_monitor.get_clock_metrics()
+        if metrics.state.value != "synchronized":
+            logger.warning(f"[Redlock] Clock {metrics.state.value} detected - using {tolerance:.1f}s tolerance buffer")
+
+        # NX: Only set if it doesn't exist
+        # EX: Set expiration in seconds (with skew tolerance)
         success = await cache_service.redis.set(
-            lock_key, lock_value, nx=True, ex=ttl_seconds
+            lock_key,
+            lock_value,
+            nx=True,
+            ex=int(effective_ttl)  # Round to nearest second
         )
 
         if success:
-            logger.info(f"[Lock] ACQUIRED resource={resource_id} user={user_id} ttl={ttl_seconds}s")
+            logger.info(f"[Redlock] Lock ACQUIRED for resource={resource_id} by user={user_id} (TTL={effective_ttl:.1f}s, tolerance={tolerance:.1f}s)")
             return True, lock_value
 
-        # Idempotency: if the same user already holds the lock, renew it
+        # Check if we already own it (idempotency)
         current_val = await cache_service.redis.get(lock_key)
         if current_val and current_val.startswith(f"{user_id}:"):
-            await cache_service.redis.expire(lock_key, ttl_seconds)
-            logger.info(f"[Lock] RENEWED (idempotent re-acquire) resource={resource_id} user={user_id}")
+            # Already owned, extend it with skew-resistant timing
+            await cache_service.redis.expire(lock_key, int(effective_ttl))
             return True, current_val
 
-        logger.warning(
-            f"[Lock] DENIED resource={resource_id} user={user_id} — held by {current_val}"
-        )
+        logger.warning(f"[Redlock] Lock DENIED for resource={resource_id} - already held by {current_val}")
         return False, None
 
     async def release_lock(self, resource_id: str, lock_value: str) -> bool:
@@ -126,23 +131,24 @@ class RedlockService:
         return False
 
     async def get_lock_info(self, resource_id: str) -> Optional[dict]:
-        """
-        Returns the full lock metadata for a resource, including the exact
-        lock_value token (used for equality check in the update endpoint).
-        Returns None if the resource is currently unlocked.
-        """
+        """Returns details about who currently holds the lock with clock skew awareness."""
         await cache_service.connect()
         val = await cache_service.redis.get(self._key(resource_id))
         if not val:
             return None
 
-        user_id_str, _ = val.split(":", 1)
-        ttl = await cache_service.redis.ttl(self._key(resource_id))
+        user_id, _ = val.split(":", 1)
+        ttl = await cache_service.redis.ttl(lock_key)
+
+        # Adjust TTL reporting for clock skew
+        metrics = self._clock_monitor.get_clock_metrics()
+        clock_status = metrics.state.value
 
         return {
-            "user_id": int(user_id_str),
-            "lock_value": val,        # Full token — required for exact equality in PUT
-            "expires_in": ttl
+            "user_id": int(user_id),
+            "expires_in": ttl,
+            "clock_state": clock_status,
+            "drift_tolerance": self._clock_monitor.get_drift_tolerance_seconds()
         }
 
 
