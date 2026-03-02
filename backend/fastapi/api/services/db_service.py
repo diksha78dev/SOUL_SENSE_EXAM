@@ -250,6 +250,25 @@ def get_pool_status():
     return {"pool_type": type(engine.pool).__name__, "message": "Metrics not supported for this pool type"}
 
 
+def get_pool_status():
+    """
+    Get metrics about the connection pool status to monitor for exhaustion.
+    """
+    from sqlalchemy.pool import QueuePool
+    
+    if isinstance(engine.pool, QueuePool):
+        return {
+            "pool_size": engine.pool.size(),
+            "checkedin": engine.pool.checkedin(),
+            "checkedout": engine.pool.checkedout(),
+            "overflow": engine.pool.overflow(),
+            "pool_timeout": engine.pool.timeout(),
+            "pool_recycle": engine.pool.recycle,
+            "can_spawn_more": engine.pool.overflow() < engine.pool.max_overflow() if hasattr(engine.pool, 'max_overflow') else False
+        }
+    return {"pool_type": type(engine.pool).__name__, "message": "Metrics not supported for this pool type"}
+
+
 class AssessmentService:
     """Service for managing assessments (scores) using AsyncSession."""
     
