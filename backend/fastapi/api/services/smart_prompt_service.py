@@ -111,24 +111,13 @@ SMART_PROMPTS = {
 # ============================================================================
 
 class SmartPromptService:
-    """Service for generating AI-personalized journal prompts."""
+    """Service for generating AI-personalized journal prompts (Async)."""
     
-    def __init__(self, db: Session):
+    def __init__(self, db: AsyncSession):
         self.db = db
     
-    def get_user_context(self, user_id: int) -> Dict[str, Any]:
-        """
-        Gather user's emotional context from multiple data sources.
-        
-        Returns:
-            Dict containing:
-            - latest_eq_score: Most recent EQ assessment score
-            - avg_sentiment_7d: Average journal sentiment over last 7 days
-            - sentiment_trend: "improving", "declining", or "stable"
-            - recent_stress_avg: Average stress level from recent journals
-            - detected_patterns: List of emotional patterns
-            - entry_count_7d: Number of journal entries in last 7 days
-        """
+    async def get_user_context(self, user_id: int) -> Dict[str, Any]:
+        """Gather context (Async)."""
         context = {
             "latest_eq_score": None,
             "avg_sentiment_7d": 50.0,
@@ -139,229 +128,144 @@ class SmartPromptService:
             "current_time_category": self._get_time_category(),
         }
         
-        # 1. Get latest EQ score
-        latest_score = self.db.query(Score).filter(
-            Score.user_id == user_id
-        ).order_by(desc(Score.timestamp)).first()
-        
+        # 1. EQ Score
+        stmt_eq = select(Score).filter(Score.user_id == user_id).order_by(desc(Score.timestamp))
+        result_eq = await self.db.execute(stmt_eq)
+        latest_score = result_eq.scalar_one_or_none()
         if latest_score:
             context["latest_eq_score"] = latest_score.total_score
         
-        # 2. Get journal sentiment trends (last 7 days)
+        # 2. Journal Trends
         week_ago = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
-        
-        recent_entries = self.db.query(JournalEntry).filter(
+        stmt_journal = select(JournalEntry).filter(
             JournalEntry.user_id == user_id,
             JournalEntry.entry_date >= week_ago,
             JournalEntry.is_deleted == False
-        ).order_by(desc(JournalEntry.entry_date)).all()
+        ).order_by(desc(JournalEntry.entry_date))
+        result_journal = await self.db.execute(stmt_journal)
+        recent_entries = list(result_journal.scalars().all())
         
         context["entry_count_7d"] = len(recent_entries)
-        
         if recent_entries:
             sentiments = [e.sentiment_score or 50.0 for e in recent_entries]
             context["avg_sentiment_7d"] = sum(sentiments) / len(sentiments)
             
-            # Calculate trend (first half vs second half)
+            # Trend
             if len(sentiments) >= 4:
                 mid = len(sentiments) // 2
                 older_avg = sum(sentiments[mid:]) / len(sentiments[mid:])
                 recent_avg = sum(sentiments[:mid]) / mid
-                
-                if recent_avg > older_avg + 5:
-                    context["sentiment_trend"] = "improving"
-                elif recent_avg < older_avg - 5:
-                    context["sentiment_trend"] = "declining"
+                if recent_avg > older_avg + 5: context["sentiment_trend"] = "improving"
+                elif recent_avg < older_avg - 5: context["sentiment_trend"] = "declining"
             
-            # Get stress levels
             stress_levels = [e.stress_level for e in recent_entries if e.stress_level]
             if stress_levels:
                 context["recent_stress_avg"] = sum(stress_levels) / len(stress_levels)
             
-            # Extract detected patterns from recent entries
             for entry in recent_entries[:5]:
                 if entry.emotional_patterns:
                     try:
                         patterns = json.loads(entry.emotional_patterns)
-                        context["detected_patterns"].extend(patterns)
+                        context["detected_patterns"].extend(patterns if isinstance(patterns, list) else [patterns])
                     except (json.JSONDecodeError, TypeError):
-                        # Handle non-JSON patterns (legacy format)
-                        if entry.emotional_patterns:
-                            context["detected_patterns"].append(entry.emotional_patterns)
-        
-        # 3. Get user's stored emotional patterns if available
-        user_patterns = self.db.query(UserEmotionalPatterns).filter(
-            UserEmotionalPatterns.user_id == user_id
-        ).first()
-        
+                        context["detected_patterns"].append(entry.emotional_patterns)
+
+        # 3. stored patterns
+        stmt_p = select(UserEmotionalPatterns).filter(UserEmotionalPatterns.user_id == user_id)
+        result_p = await self.db.execute(stmt_p)
+        user_patterns = result_p.scalar_one_or_none()
         if user_patterns and user_patterns.common_emotions:
             try:
                 common = json.loads(user_patterns.common_emotions)
-                context["detected_patterns"].extend(common)
-            except (json.JSONDecodeError, TypeError):
-                pass
+                context["detected_patterns"].extend(common if isinstance(common, list) else [common])
+            except: pass
         
-        # Deduplicate patterns
-        context["detected_patterns"] = list(set(context["detected_patterns"]))
-        
+        context["detected_patterns"] = list(set([str(p) for p in context["detected_patterns"] if p]))
         return context
-    
+
     def _get_time_category(self) -> str:
-        """Determine time category for context-aware prompts."""
         hour = datetime.now().hour
-        if 5 <= hour < 12:
-            return "morning"
-        elif 12 <= hour < 17:
-            return "afternoon"
-        elif 17 <= hour < 21:
-            return "evening"
-        else:
-            return "night"
-    
+        if 5 <= hour < 12: return "morning"
+        elif 12 <= hour < 17: return "afternoon"
+        elif 17 <= hour < 21: return "evening"
+        else: return "night"
+
     def _determine_prompt_categories(self, context: Dict[str, Any]) -> List[str]:
-        """
-        Determine which prompt categories are most relevant based on user context.
-        
-        Returns prioritized list of categories.
-        """
         categories = []
         patterns = [p.lower() for p in context.get("detected_patterns", [])]
         
-        # Check stress levels
-        stress_avg = context.get("recent_stress_avg")
-        if stress_avg and stress_avg >= 7:
-            categories.append("stress")
-        
-        # Check sentiment
+        if (context.get("recent_stress_avg") or 0) >= 7: categories.append("stress")
         avg_sentiment = context.get("avg_sentiment_7d", 50)
-        if avg_sentiment < 35:
-            categories.append("sadness")
-        elif avg_sentiment > 70:
+        if avg_sentiment < 35: categories.append("sadness")
+        elif avg_sentiment > 70: 
             categories.append("positivity")
             categories.append("gratitude")
         
-        # Check detected patterns
-        if any(p in patterns for p in ["anxiety", "worried", "nervous", "anxious"]):
-            categories.append("anxiety")
-        if any(p in patterns for p in ["fatigue", "tired", "exhausted", "low_energy"]):
-            categories.append("low_energy")
-        if any(p in patterns for p in ["hope", "hopeful", "optimistic"]):
-            categories.append("positivity")
+        if any(p in patterns for p in ["anxiety", "worried", "nervous"]): categories.append("anxiety")
+        if any(p in patterns for p in ["fatigue", "tired"]): categories.append("low_energy")
         
-        # Check EQ score
-        eq_score = context.get("latest_eq_score")
-        if eq_score and eq_score < 40:
-            categories.append("reflection")
+        if (context.get("latest_eq_score") or 100) < 40: categories.append("reflection")
+        if not categories: categories = ["general", "reflection", "gratitude"]
         
-        # Add general prompts if low engagement
-        if context.get("entry_count_7d", 0) < 2:
-            categories.append("general")
-        
-        # Always include some positives
-        if "gratitude" not in categories and "positivity" not in categories:
-            categories.append("gratitude")
-        
-        # Ensure we have categories
-        if not categories:
-            categories = ["general", "reflection", "gratitude"]
-        
-        return list(dict.fromkeys(categories))  # Dedupe while preserving order
-    
-    def get_smart_prompts(
-        self, 
-        user_id: int, 
-        count: int = 3
-    ) -> Dict[str, Any]:
-        """
-        Get personalized journal prompts for a user.
-        
-        Args:
-            user_id: The user's ID
-            count: Number of prompts to return (default 3)
-            
-        Returns:
-            Dict containing:
-            - prompts: List of prompt objects with context reasons
-            - user_mood: Detected mood category
-            - detected_patterns: List of patterns found
-        """
-        context = self.get_user_context(user_id)
+        return list(dict.fromkeys(categories))
+
+    async def get_smart_prompts(self, user_id: int, count: int = 3) -> Dict[str, Any]:
+        """Get prompts (Async)."""
+        context = await self.get_user_context(user_id)
         categories = self._determine_prompt_categories(context)
         
-        # Determine overall mood label
-        avg_sentiment = context.get("avg_sentiment_7d", 50)
-        if avg_sentiment >= 65:
-            mood = "positive"
-        elif avg_sentiment <= 35:
-            mood = "low"
-        else:
-            mood = "neutral"
+        avg_s = context.get("avg_sentiment_7d", 50)
+        mood = "positive" if avg_s >= 65 else "low" if avg_s <= 35 else "neutral"
         
-        # Collect prompts from relevant categories
-        selected_prompts = []
-        used_ids = set()
+        selected = []
+        used = set()
         
-        for category in categories:
-            if len(selected_prompts) >= count:
-                break
-                
-            category_prompts = SMART_PROMPTS.get(category, [])
-            available = [p for p in category_prompts if p["id"] not in used_ids]
-            
+        for cat in categories:
+            if len(selected) >= count: break
+            available = [p for p in SMART_PROMPTS.get(cat, []) if p["id"] not in used]
             if available:
-                prompt = random.choice(available)
-                used_ids.add(prompt["id"])
-                selected_prompts.append({
-                    "id": prompt["id"],
-                    "prompt": prompt["prompt"],
-                    "category": category,
-                    "context_reason": self._get_context_reason(category, context),
-                    "description": prompt.get("description", "")
+                p = random.choice(available)
+                used.add(p["id"])
+                selected.append({
+                    "id": p["id"], "prompt": p["prompt"], "category": cat,
+                    "context_reason": self._get_context_reason(cat, context),
+                    "description": p.get("description", "")
                 })
         
-        # Fill remaining slots from general if needed
-        while len(selected_prompts) < count:
-            general_prompts = SMART_PROMPTS.get("general", [])
-            available = [p for p in general_prompts if p["id"] not in used_ids]
-            if not available:
-                break
-            prompt = random.choice(available)
-            used_ids.add(prompt["id"])
-            selected_prompts.append({
-                "id": prompt["id"],
-                "prompt": prompt["prompt"],
-                "category": "general",
-                "context_reason": "A good prompt for self-reflection",
-                "description": prompt.get("description", "")
+        while len(selected) < count:
+            available = [p for p in SMART_PROMPTS.get("general", []) if p["id"] not in used]
+            if not available: break
+            p = random.choice(available)
+            used.add(p["id"])
+            selected.append({
+                "id": p["id"], "prompt": p["prompt"], "category": "general",
+                "context_reason": "General reflection",
+                "description": p.get("description", "")
             })
-        
+            
         return {
-            "prompts": selected_prompts,
+            "prompts": selected,
             "user_mood": mood,
             "detected_patterns": context.get("detected_patterns", [])[:5],
-            "sentiment_avg": round(avg_sentiment, 1),
+            "sentiment_avg": round(avg_s, 1),
         }
-    
+
     def _get_context_reason(self, category: str, context: Dict[str, Any]) -> str:
-        """Generate a human-readable reason for why this category was selected."""
-        stress_avg = context.get('recent_stress_avg')
-        stress_display = f"{stress_avg:.1f}/10" if stress_avg is not None else "elevated"
-        
         reasons = {
-            "anxiety": "We noticed some anxious patterns in your recent entries",
-            "stress": f"Your stress levels have been {stress_display}",
-            "sadness": "Your recent sentiment has been lower than usual",
-            "low_energy": "You've mentioned feeling tired or low energy",
-            "gratitude": "Gratitude journaling can boost your mood",
-            "positivity": "You've been feeling good – let's build on that!",
-            "reflection": "A moment for self-reflection based on your EQ insights",
-            "relationships": "Connection with others is important for wellbeing",
-            "creativity": "Creative thinking can boost mental flexibility",
-            "general": "A thoughtful prompt for today's reflection",
+            "anxiety": "Based on anxious patterns in your writing",
+            "stress": "Because your stress levels are elevated",
+            "sadness": "To support you during lower moods",
+            "low_energy": "To help when you're feeling tired",
+            "gratitude": "To build on your positive energy",
+            "positivity": "Expanding on your recent good news",
+            "reflection": "Connecting with your EQ insights",
+            "relationships": "Focusing on your connections",
+            "creativity": "Exploring your creative vision",
+            "general": "A thoughtful prompt for today",
         }
-        return reasons.get(category, "Selected to support your journaling practice")
+        return reasons.get(category, "Personalized for you")
 
 
-def get_smart_prompt_service(db: Session) -> SmartPromptService:
+def get_smart_prompt_service(db: AsyncSession) -> SmartPromptService:
     """Dependency injection helper for FastAPI."""
     return SmartPromptService(db)

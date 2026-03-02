@@ -20,26 +20,29 @@ except ImportError:
 
 logger = logging.getLogger("api.exam")
 
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, insert, update
+
 class ExamService:
     """
-    Service for handling Exam write operations via API with strict business logic validation.
+    Service for handling Exam write operations via API with strict business logic validation (Async).
     """
 
-    EXAM_DURATION_MINUTES = 60  # Maximum time allowed for an exam
+    EXAM_DURATION_MINUTES = 60
 
     @staticmethod
-    def start_exam(db: Session, user: User) -> str:
+    async def start_exam(db: AsyncSession, user: User) -> str:
         """
-        Initiates a new exam session, persists it to DB, and returns session_id.
-        Prevents multiple active sessions if necessary (policy decision).
+        Initiates a new exam session (Async).
         """
-        # 1. Check for existing active sessions to prevent 'multiple attempts' bypass
-        # (Optional: allow resumed sessions if they haven't expired)
-        active_session = db.query(ExamSession).filter(
+        # 1. Check for existing active sessions
+        stmt = select(ExamSession).filter(
             ExamSession.user_id == user.id,
             ExamSession.status.in_(['STARTED', 'IN_PROGRESS']),
             ExamSession.expires_at > datetime.now(UTC)
-        ).first()
+        )
+        result = await db.execute(stmt)
+        active_session = result.scalar_one_or_none()
 
         if active_session:
              logger.info(f"User resumed existing exam session", extra={
@@ -63,7 +66,7 @@ class ExamService:
         
         try:
             db.add(new_session)
-            db.commit()
+            await db.commit()
             logger.info(f"New exam session created", extra={
                 "user_id": user.id,
                 "session_id": session_id,
@@ -71,16 +74,16 @@ class ExamService:
             })
             return session_id
         except Exception as e:
-            db.rollback()
+            await db.rollback()
             logger.error(f"Failed to create exam session: {e}")
             raise APIException(ErrorCode.INTERNAL_SERVER_ERROR, "Failed to initiate exam")
 
     @staticmethod
-    def _get_valid_session(db: Session, user_id: int, session_id: str, allowed_statuses: List[str]) -> ExamSession:
-        """Helper to fetch and validate an exam session."""
-        session = db.query(ExamSession).filter(
-            ExamSession.session_id == session_id
-        ).first()
+    async def _get_valid_session(db: AsyncSession, user_id: int, session_id: str, allowed_statuses: List[str]) -> ExamSession:
+        """Helper to fetch and validate an exam session (Async)."""
+        stmt = select(ExamSession).filter(ExamSession.session_id == session_id)
+        result = await db.execute(stmt)
+        session = result.scalar_one_or_none()
 
         if not session:
             logger.warning(f"Exam session not found: {session_id}", extra={"user_id": user_id})
@@ -106,11 +109,11 @@ class ExamService:
                 f"Invalid workflow sequence. Current status: {session.status}"
             )
 
-        # Check for expiration (Workflow validation)
+        # Check for expiration
         if session.expires_at.replace(tzinfo=UTC) < datetime.now(UTC):
             logger.warning(f"Exam session expired: {session_id}", extra={"user_id": user_id})
             session.status = 'ABANDONED'
-            db.commit()
+            await db.commit()
             raise APIException(
                 ErrorCode.WFK_SESSION_EXPIRED, 
                 "Exam session has expired. Please start a new one."
@@ -119,17 +122,14 @@ class ExamService:
         return session
 
     @staticmethod
-    def save_response(db: Session, user: User, session_id: str, data: ExamResponseCreate):
-        """Saves a single question response with session state validation."""
-        # 1. Validate session state
-        session = ExamService._get_valid_session(db, user.id, session_id, ['STARTED', 'IN_PROGRESS'])
+    async def save_response(db: AsyncSession, user: User, session_id: str, data: ExamResponseCreate):
+        """Saves a single question response (Async)."""
+        session = await ExamService._get_valid_session(db, user.id, session_id, ['STARTED', 'IN_PROGRESS'])
 
         try:
-            # 2. Update session status to IN_PROGRESS if it was STARTED
             if session.status == 'STARTED':
                 session.status = 'IN_PROGRESS'
 
-            # 3. Save the response
             new_response = Response(
                 username=user.username,
                 user_id=user.id,
@@ -140,34 +140,28 @@ class ExamService:
                 timestamp=datetime.now(UTC).isoformat()
             )
             db.add(new_response)
-            db.commit()
+            await db.commit()
             return True
         except Exception as e:
+            await db.rollback()
             logger.error(f"Failed to save response", extra={
                 "user_id": user.id,
                 "session_id": session_id,
                 "question_id": data.question_id,
                 "error": str(e)
             }, exc_info=True)
-            db.rollback()
             raise e
 
     @staticmethod
     @retry_on_transient(retries=3)
-    def save_score(db: Session, user: User, session_id: str, data: ExamResultCreate):
-        """
-        Saves the final exam score with strict state checking.
-        Requires session to be in 'SUBMITTED' state (via /api/v1/exams/submit).
-        """
-        # 1. Validate session state (Must be SUBMITTED before scoring allowed)
-        session = ExamService._get_valid_session(db, user.id, session_id, ['SUBMITTED'])
+    async def save_score(db: AsyncSession, user: User, session_id: str, data: ExamResultCreate):
+        """Saves final exam score (Async)."""
+        session = await ExamService._get_valid_session(db, user.id, session_id, ['SUBMITTED'])
 
         try:
-            # Check for Replay Attack (Already completed)
             if session.completed_at:
                 raise APIException(ErrorCode.WFK_REPLAY_ATTACK, "Exam score already recorded")
 
-            # Encrypt reflection text for privacy
             reflection = data.reflection_text
             if CRYPTO_AVAILABLE and reflection:
                 try:
@@ -175,8 +169,7 @@ class ExamService:
                 except Exception as ce:
                     logger.error(f"Encryption failed for reflection: {ce}")
 
-            # ── ATOMIC WRITE ─────────────────────────────────────────────────
-            with transactional(db):
+            async with transactional(db) as tx_session:
                 new_score = Score(
                     username=user.username,
                     user_id=user.id,
@@ -190,50 +183,44 @@ class ExamService:
                     detailed_age_group=data.detailed_age_group,
                     session_id=session_id
                 )
-                db.add(new_score)
-                db.flush()
+                tx_session.add(new_score)
+                await tx_session.flush()
 
-                # Update session state
                 session.status = 'COMPLETED'
                 session.completed_at = datetime.now(UTC)
 
-                GamificationService.award_xp(db, user.id, 100, "Assessment completion")
-                GamificationService.update_streak(db, user.id, "assessment")
-                GamificationService.check_achievements(db, user.id, "assessment")
-            # ─────────────────────────────────────────────────────────────────
+                await GamificationService.award_xp(tx_session, user.id, 100, "Assessment completion")
+                await GamificationService.update_streak(tx_session, user.id, "assessment")
+                await GamificationService.check_achievements(tx_session, user.id, "assessment")
 
-            db.refresh(new_score)
-
-            logger.info(f"Exam completed successfully", extra={
-                "user_id": user.id,
-                "session_id": session_id,
-                "score": data.total_score
-            })
+            await db.refresh(new_score)
             return new_score
 
         except Exception as e:
             if not isinstance(e, APIException):
-                logger.error(f"Failed to save exam score", extra={
-                    "user_id": user.id,
-                    "session_id": session_id,
-                    "error": str(e)
-                }, exc_info=True)
+                logger.error(f"Failed to save exam score: {e}")
             raise e
 
     @staticmethod
-    def mark_as_submitted(db: Session, user_id: int, session_id: str):
-        """Transitions a session to SUBMITTED state."""
-        session = ExamService._get_valid_session(db, user_id, session_id, ['STARTED', 'IN_PROGRESS'])
+    async def mark_as_submitted(db: AsyncSession, user_id: int, session_id: str):
+        """Transitions a session to SUBMITTED state (Async)."""
+        session = await ExamService._get_valid_session(db, user_id, session_id, ['STARTED', 'IN_PROGRESS'])
         session.status = 'SUBMITTED'
         session.submitted_at = datetime.now(UTC)
-        db.commit()
-        logger.info(f"Exam session marked as SUBMITTED", extra={"user_id": user_id, "session_id": session_id})
+        await db.commit()
 
     @staticmethod
-    def get_history(db: Session, user: User, skip: int = 0, limit: int = 10) -> Tuple[List[Score], int]:
-        """Retrieves paginated exam history for the specified user."""
+    async def get_history(db: AsyncSession, user: User, skip: int = 0, limit: int = 10) -> Tuple[List[Score], int]:
+        """Retrieves paginated history for user (Async)."""
         limit = min(limit, 100)
-        query = db.query(Score).filter(Score.user_id == user.id)
-        total = query.count()
-        results = query.order_by(Score.timestamp.desc()).offset(skip).limit(limit).all()
-        return results, total
+        stmt = select(Score).filter(Score.user_id == user.id)
+        
+        # Get count
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        total_result = await db.execute(count_stmt)
+        total = total_result.scalar() or 0
+        
+        # Paginate
+        stmt = stmt.order_by(Score.timestamp.desc()).offset(skip).limit(limit)
+        result = await db.execute(stmt)
+        return list(result.scalars().all()), total
