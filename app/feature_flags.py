@@ -89,6 +89,13 @@ EXPERIMENTAL_FLAGS: Dict[str, FeatureFlag] = {
         experimental=True,
         category="infra"
     ),
+    "capacity_headroom_forecasting": FeatureFlag(
+        name="capacity_headroom_forecasting",
+        default=False,
+        description="Enable capacity headroom forecasting for peak windows",
+        experimental=True,
+        category="infra"
+    ),
 }
 
 
