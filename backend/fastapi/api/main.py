@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 import time
 import traceback
@@ -19,6 +20,15 @@ from .utils.logging_config import setup_logging
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from .services.websocket_manager import manager as ws_manager
+
+# Initialize AsyncWorkerManager for memory-safe background workers (#1219)
+try:
+    from .services.worker_manager import AsyncWorkerManager
+    worker_manager = AsyncWorkerManager()
+    print("[OK] AsyncWorkerManager initialized for memory leak prevention")
+except Exception as e:
+    print(f"[WARNING] AsyncWorkerManager initialization failed: {e}")
+    worker_manager = None
 
 # Initialize centralized logging
 setup_logging()
@@ -63,6 +73,11 @@ async def lifespan(app: FastAPI):
 
     app.state.settings = settings
 
+    # Configure bounded default executor to avoid unbounded thread growth
+    loop = asyncio.get_running_loop()
+    app.state.thread_pool_executor = ThreadPoolExecutor(max_workers=settings.thread_pool_max_workers)
+    loop.set_default_executor(app.state.thread_pool_executor)
+
     # Generate a unique instance ID for this server session
     # All JWTs will include this ID; tokens from previous instances are rejected
     app.state.server_instance_id = str(uuid.uuid4())
@@ -89,6 +104,21 @@ async def lifespan(app: FastAPI):
     
     # Initialize database tables
     try:
+        from .services.db_service import Base, engine, AsyncSessionLocal
+        # Note: metadata.create_all is typically sync, for async we use run_sync
+        async def init_models():
+            async with engine.begin() as conn:
+                # await conn.run_sync(Base.metadata.drop_all)
+                await conn.run_sync(Base.metadata.create_all)
+        
+        await init_models()
+        logger.info("Database tables initialized/verified (Async)")
+        
+        # Verify database connectivity
+        async with AsyncSessionLocal() as db:
+            from sqlalchemy import text
+            await db.execute(text("SELECT 1"))
+            logger.info("Database connectivity verified (Async)")
         from .models import Base
         from .services.db_service import engine, AsyncSessionLocal
         # Note: In a production app, we would use migrations, but for this exercise we can auto-create
@@ -101,13 +131,25 @@ async def lifespan(app: FastAPI):
             await db.execute(text("SELECT 1"))
             print("[OK] Database connectivity verified")
         
-        # Initialize Redis for rate limiting
+        # Initialize Redis for rate limiting with proper connection pool settings
         try:
             import redis.asyncio as redis
             redis_client = redis.from_url(
                 settings.redis_url,
                 encoding="utf-8",
-                decode_responses=True
+                decode_responses=True,
+                # Connection pool configuration for issue #1210 (Redis pool exhaustion fix)
+                max_connections=50,  # Maximum connections in the pool
+                socket_timeout=2.0,  # Timeout for operations
+                socket_connect_timeout=2.0,  # Timeout for initial connection
+                socket_keepalive=True,  # Keep connections alive
+                socket_keepalive_options={
+                    1: 3,  # TCP_KEEPIDLE
+                    2: 3,  # TCP_KEEPINTVL
+                    3: 3   # TCP_KEEPCNT
+                } if hasattr(redis, 'socket_keepalive_options') else None,
+                retry_on_timeout=False,  # Don't retry on timeout to prevent hanging
+                health_check_interval=10  # Periodic health checks
             )
             # Test Redis connectivity
             await redis_client.ping()
@@ -115,6 +157,7 @@ async def lifespan(app: FastAPI):
             
             # Configure slowapi limiter with Redis storage
             limiter._storage_uri = settings.redis_url
+            logger.info(f"Redis connected for rate limiting: {settings.redis_host}:{settings.redis_port} with pool_size=50")
             print(f"[OK] Redis connected for rate limiting: {settings.redis_host}:{settings.redis_port}")
             
             # Initialize JWT blacklist
@@ -123,7 +166,7 @@ async def lifespan(app: FastAPI):
             print("[OK] JWT blacklist initialized")
             
         except Exception as e:
-            logger.warning(f"Redis initialization failed: {e}")
+            logger.warning(f"Redis initialization failed: {e}", exc_info=True)
             print(f"[WARNING] Redis not available, rate limiting will use in-memory fallback: {e}")
             # SlowAPI will automatically fall back to in-memory storage if Redis is unavailable
             
@@ -148,28 +191,42 @@ async def lifespan(app: FastAPI):
             print(f"[WARNING] WebSocket Manager Redis connect failed: {e}")
 
         
-        # Start background task for soft-delete cleanup
+        # Start background task for soft-delete cleanup with memory-safe worker management
         async def purge_task_loop():
             while True:
                 try:
+                    logger.info("Starting scheduled purge of expired accounts...", extra={"task": "cleanup"})
                     print("[CLEANUP] Starting scheduled purge of expired accounts...")
                     from .services.db_service import AsyncSessionLocal
                     async with AsyncSessionLocal() as db:
                         from .services.user_service import UserService
                         user_service = UserService(db)
                         await user_service.purge_deleted_users(settings.deletion_grace_period_days)
+                    logger.info("Scheduled purge completed successfully", extra={"task": "cleanup"})
                     print("[CLEANUP] Scheduled purge completed successfully")
                 except Exception as e:
                     logger = logging.getLogger("api.purge_task")
                     logger.error(f"Soft-delete cleanup task failed: {e}", exc_info=True)
                     # Continue the loop instead of crashing - the task will retry in 24 hours
-                
+
                 # Run once every 24 hours
                 await asyncio.sleep(24 * 3600)
-        
-        purge_task = asyncio.create_task(purge_task_loop())
-        app.state.purge_task = purge_task  # Store reference for cleanup
-        print("[OK] Soft-delete cleanup task scheduled (runs every 24h)")
+
+        if worker_manager:
+            # Register with AsyncWorkerManager for memory leak prevention
+            await worker_manager.register_worker(
+                name="soft_delete_purge",
+                worker_func=purge_task_loop,
+                restart_on_failure=True,
+                memory_threshold_mb=50.0,
+                cleanup_interval_seconds=3600
+            )
+            print("[OK] Soft-delete cleanup task registered with AsyncWorkerManager")
+        else:
+            # Fallback to direct task creation
+            purge_task = asyncio.create_task(purge_task_loop())
+            app.state.purge_task = purge_task  # Store reference for cleanup
+            print("[OK] Soft-delete cleanup task scheduled (runs every 24h)")
 
         # Kafka producer and Audit Consumer initialization (#1085)
         try:
@@ -193,17 +250,29 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Kafka/Audit initialization failed: {e}")
             print(f"[WARNING] Event-sourced audit trail falling back to mock mode: {e}")
         
-        # Initialize Cache Invalidation Listener (#1123)
+        # Initialize Cache Invalidation Listener (#1123) with memory-safe worker management
         try:
             from .services.cache_service import cache_service
-            invalidation_task = asyncio.create_task(cache_service.start_invalidation_listener())
-            app.state.invalidation_task = invalidation_task
-            print("[OK] Distributed Cache Invalidation listener started via Redis Pub/Sub")
+            if worker_manager:
+                # Register with AsyncWorkerManager for memory leak prevention
+                await worker_manager.register_worker(
+                    name="cache_invalidation_listener",
+                    worker_func=cache_service.start_invalidation_listener,
+                    restart_on_failure=True,
+                    memory_threshold_mb=100.0,
+                    cleanup_interval_seconds=300
+                )
+                print("[OK] Distributed Cache Invalidation listener registered with AsyncWorkerManager")
+            else:
+                # Fallback to direct task creation
+                invalidation_task = asyncio.create_task(cache_service.start_invalidation_listener())
+                app.state.invalidation_task = invalidation_task
+                print("[OK] Distributed Cache Invalidation listener started via Redis Pub/Sub")
         except Exception as e:
             logger.warning(f"Failed to start cache invalidation listener: {e}")
             print(f"[WARNING] Distributed cache invalidation unavailable: {e}")
         
-        # Initialize Search Index Outbox Relay (#1146)
+        # Initialize Search Index Outbox Relay (#1146) with memory-safe worker management
         try:
             from .services.outbox_relay_service import OutboxRelayService
             from .services.db_service import AsyncSessionLocal
@@ -247,6 +316,12 @@ async def lifespan(app: FastAPI):
     # SHUTDOWN LOGIC
     logger.info("LIFESPAN TEARDOWN STARTED")
 
+    # Stop AsyncWorkerManager and all registered workers (#1219)
+    if worker_manager:
+        logger.info("Shutting down AsyncWorkerManager and all background workers...")
+        await worker_manager.shutdown_all_workers()
+        logger.info("AsyncWorkerManager shutdown successfully")
+
     # Stop FD Resource Manager and Event Loop Health Monitor (#1183)
     if hasattr(app.state, 'fd_monitor'):
         logger.info("Shutting down FD Resource Manager and Event Loop Health Monitor...")
@@ -262,8 +337,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Clock skew monitoring shutdown failed: {e}")
     
-    # Cancel background tasks
-    if hasattr(app.state, 'purge_task'):
+    # Cancel background tasks (fallback for non-worker-manager tasks)
+    if hasattr(app.state, 'purge_task') and not worker_manager:
         logger.info("Cancelling background purge task...")
         app.state.purge_task.cancel()
         try:
@@ -271,7 +346,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             logger.info("Background purge task cancelled successfully")
             
-    if hasattr(app.state, 'invalidation_task'):
+    if hasattr(app.state, 'invalidation_task') and not worker_manager:
         logger.info("Cancelling distributed cache invalidation listener...")
         app.state.invalidation_task.cancel()
         try:
@@ -279,7 +354,10 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             logger.info("Cache invalidation listener cancelled successfully")
 
-    if hasattr(app.state, 'outbox_relay_task'):
+    if hasattr(app.state, 'thread_pool_executor'):
+        app.state.thread_pool_executor.shutdown(wait=False, cancel_futures=True)
+
+    if hasattr(app.state, 'outbox_relay_task') and not worker_manager:
         logger.info("Stopping Search Index Outbox Relay worker...")
         app.state.outbox_relay_task.cancel()
         try:
@@ -299,14 +377,21 @@ async def lifespan(app: FastAPI):
         await app.state.ws_manager.shutdown()
         logger.info("WebSocket Manager shutdown successfully")
     
-    # Close Redis connection
+    # Close Redis connection (issue #1210: proper cleanup to prevent resource leaks)
     if hasattr(app.state, 'redis_client'):
         logger.info("Closing Redis connection...")
         try:
-            await app.state.redis_client.close()
+            redis_client = app.state.redis_client
+            # Ensure all pending operations are cleared
+            await redis_client.close()
             logger.info("Redis connection closed successfully")
         except Exception as e:
             logger.error(f"Error closing Redis connection: {e}")
+            try:
+                # Force cleanup even if close fails
+                await redis_client.connection_pool.disconnect()
+            except Exception as e2:
+                logger.error(f"Error on Redis pool disconnect: {e2}")
 
     # Stop Kafka Producer (#1085)
     if hasattr(app.state, 'kafka_producer'):
@@ -389,6 +474,11 @@ def create_app() -> FastAPI:
         lifespan=lifespan
     )
 
+    # Payload Size Limits and DoS Protection Middleware (outermost to block large payloads early)
+    # Issue #1068: Prevents backend crashes due to oversized or malformed payloads
+    from .middleware.payload_limit_middleware import PayloadLimitMiddleware
+    app.add_middleware(PayloadLimitMiddleware)
+    
     # Correlation ID middleware (outermost for logging reference)
     app.add_middleware(CorrelationIDMiddleware)
     @app.get("/favicon.ico", include_in_schema=False)
@@ -404,12 +494,41 @@ def create_app() -> FastAPI:
     from .middleware.logging_middleware import RequestLoggingMiddleware
     app.add_middleware(RequestLoggingMiddleware)
 
+    # Session cleanup middleware: safety-net to close leaked DB sessions
+    from .middleware.session_middleware import SessionCleanupMiddleware
+    app.add_middleware(SessionCleanupMiddleware)
+
     # GZip compression middleware for response optimization
     app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
 
     # Security Headers Middleware
     from .middleware.security import SecurityHeadersMiddleware
     app.add_middleware(SecurityHeadersMiddleware)
+
+    # Signed URL Validation Middleware (#1262)
+    # Validates signed URLs for object storage with hardening policies
+    from .middleware.signed_url_middleware import SignedURLValidationMiddleware
+    app.add_middleware(SignedURLValidationMiddleware)
+
+    # Auth Anomaly Detection Middleware (#1263)
+    # Detects suspicious authentication behavior and applies risk-based enforcement
+    from .middleware.auth_anomaly_middleware import AuthAnomalyMiddleware
+    app.add_middleware(AuthAnomalyMiddleware)
+
+    # API Key Authentication Middleware (#1264)
+    # Enforces fine-grained API key scopes for access control
+    from .middleware.api_key_middleware import api_key_middleware
+    app.add_middleware(BaseHTTPMiddleware, dispatch=api_key_middleware)
+
+    # Device Fingerprint Validation Middleware (#1230)
+    # Validates device fingerprints on authenticated requests to prevent session hijacking
+    from .middleware.device_fingerprint_middleware import DeviceFingerprintValidationMiddleware
+    app.add_middleware(DeviceFingerprintValidationMiddleware)
+
+    # Step-Up Authentication Middleware (#1245)
+    # Enforces 2FA re-verification for privileged operations
+    from .middleware.step_up_auth_middleware import StepUpAuthMiddleware
+    app.add_middleware(StepUpAuthMiddleware)
 
     # Consent Validation Middleware for privacy compliance
     # Blocks analytics data collection without user consent
@@ -510,6 +629,27 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(APIException)
     async def api_exception_handler(request: Request, exc: APIException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=exc.detail
+        )
+    
+    # Payload Size Limit Exception Handlers (Issue #1068)
+    from .exceptions import PayloadSizeException
+    
+    @app.exception_handler(PayloadSizeException)
+    async def payload_size_exception_handler(request: Request, exc: PayloadSizeException):
+        logger = logging.getLogger("api.payload_limit")
+        request_id = getattr(request.state, 'request_id', 'unknown')
+        logger.warning(
+            f"Payload size violation: {exc.detail.get('message', 'Unknown')}",
+            extra={
+                "request_id": request_id,
+                "path": request.url.path,
+                "code": exc.detail.get('code'),
+                "details": exc.detail.get('details')
+            }
+        )
         return JSONResponse(
             status_code=exc.status_code,
             content=exc.detail

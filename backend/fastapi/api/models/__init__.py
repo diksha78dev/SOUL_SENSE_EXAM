@@ -14,7 +14,7 @@ import logging
 from ..utils.timestamps import normalize_utc_iso, utc_now, utc_now_iso
 
 try:
-    from ..services.encryption_service import EncryptedString
+    from ..utils.encrypted_type import EncryptedString
 except (ImportError, ValueError):
     EncryptedString = Text
 
@@ -36,6 +36,7 @@ class User(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String, unique=True, nullable=False)
+    email = Column(String, unique=True, nullable=True)  # User email for notifications
     password_hash = Column(String, nullable=False)
     oauth_sub = Column(String, nullable=True, unique=True)  # OAuth subject identifier
     created_at = Column(String, default=utc_now_iso)
@@ -64,6 +65,8 @@ class User(Base):
     audit_logs = relationship("AuditLog", back_populates="user", cascade="all, delete-orphan")
     audit_snapshots = relationship("AuditSnapshot", back_populates="user", cascade="all, delete-orphan")
     sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
+    step_up_tokens = relationship("StepUpToken", back_populates="user", cascade="all, delete-orphan")
+    anomaly_events = relationship("AuthAnomalyEvent", back_populates="user", cascade="all, delete-orphan")
     
     # Gamification Relationships
     achievements = relationship("UserAchievement", back_populates="user", cascade="all, delete-orphan")
@@ -269,6 +272,7 @@ class LoginAttempt(Base):
     """
     __tablename__ = 'login_attempts'
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
     username = Column(String, index=True)
     ip_address = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
@@ -276,8 +280,24 @@ class LoginAttempt(Base):
     user_agent = Column(String, nullable=True)
     failure_reason = Column(String, nullable=True)
 
+class AuthAnomalyEvent(Base):
+    """Track authentication anomaly events for security monitoring (#1263)."""
+    __tablename__ = 'auth_anomaly_events'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
+    anomaly_type = Column(String, nullable=False, index=True)  # AnomalyType enum value
+    risk_level = Column(String, nullable=False)  # RiskLevel enum value
+    risk_score = Column(Float, nullable=False)
+    ip_address = Column(String, nullable=False)
+    user_agent = Column(String, nullable=True)
+    triggered_rules = Column(Text, nullable=True)  # JSON array of triggered rule names
+    details = Column(Text, nullable=True)  # JSON object with anomaly details
+    created_at = Column(DateTime, default=utc_now, index=True)
+
+    user = relationship("User", back_populates="anomaly_events")
+
 class AuditLog(Base):
-    """Audit Log for tracking security-critical user actions."""
+    """Audit Log for tracking security-critical user actions with tamper-evident hash chaining (#1265)."""
     __tablename__ = 'audit_logs'
     tenant_id = Column(UUID(as_uuid=True), index=True, nullable=True)
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -285,6 +305,12 @@ class AuditLog(Base):
     action = Column(String, nullable=False)
     details = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+
+    # Tamper-evident hash chaining fields (#1265)
+    previous_hash = Column(String(64), nullable=False, index=True)  # SHA-256 hash of previous entry
+    current_hash = Column(String(64), nullable=False, unique=True, index=True)  # SHA-256 hash of this entry
+    chain_hash = Column(String(64), nullable=False, index=True)  # Running chain hash for quick validation
+
     user = relationship("User", back_populates="audit_logs")
 
 class AuditSnapshot(Base):
@@ -459,7 +485,7 @@ class TokenRevocation(Base):
     expires_at = Column(DateTime, nullable=False)
 
 class UserSession(Base):
-    """Track user login sessions with unique session IDs"""
+    """Track user login sessions with unique session IDs and device fingerprinting"""
     __tablename__ = 'user_sessions'
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String, unique=True, nullable=False, index=True)
@@ -470,13 +496,50 @@ class UserSession(Base):
     is_active = Column(Boolean, default=True)
     last_activity = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=utc_now)
-    
+
+    # Device fingerprinting fields (#1230)
+    device_fingerprint_hash = Column(String(64), nullable=True, index=True)
+    device_user_agent = Column(Text, nullable=True)
+    device_accept_language = Column(String, nullable=True)
+    device_accept_encoding = Column(String, nullable=True)
+    device_screen_resolution = Column(String, nullable=True)
+    device_timezone_offset = Column(Integer, nullable=True)
+    device_platform = Column(String, nullable=True)
+    device_plugins_hash = Column(String, nullable=True)
+    device_canvas_fingerprint = Column(String, nullable=True)
+    device_webgl_fingerprint = Column(String, nullable=True)
+    device_fingerprint_created_at = Column(DateTime, nullable=True)
+
     user = relationship("User", back_populates="sessions")
-    
+
     __table_args__ = (
         Index('idx_session_user_active', 'user_id', 'is_active'),
         Index('idx_session_username_active', 'username', 'is_active'),
         Index('idx_session_created', 'created_at'),
+        Index('ix_user_sessions_device_fingerprint_hash', 'device_fingerprint_hash'),
+    )
+
+class StepUpToken(Base):
+    """Time-bound tokens for privileged action authentication (#1245)"""
+    __tablename__ = 'step_up_tokens'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    token = Column(String, unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    session_id = Column(String, nullable=False, index=True)  # Link to active session
+    purpose = Column(String, nullable=False)  # e.g., "delete_account", "admin_action", "change_password"
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=utc_now)
+    used_at = Column(DateTime, nullable=True)
+    is_used = Column(Boolean, default=False)
+    ip_address = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+
+    user = relationship("User", back_populates="step_up_tokens")
+
+    __table_args__ = (
+        Index('idx_stepup_user_session', 'user_id', 'session_id'),
+        Index('idx_stepup_expires', 'expires_at'),
+        Index('idx_stepup_token_used', 'token', 'is_used'),
     )
 
 class UserSyncSetting(Base):
@@ -590,6 +653,7 @@ class Score(Base):
     timestamp = Column(String, default=lambda: datetime.utcnow().isoformat(), index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
     session_id = Column(String, nullable=True, index=True)
+    environment = Column(String, nullable=True, index=True)  # Environment column ensures strict separation between staging and production data
     user = relationship("User", back_populates="scores")
     
     __table_args__ = (
@@ -1392,4 +1456,192 @@ def receive_after_update_notif_pref(mapper, connection, target):
     user_id = target.__dict__.get('user_id')
     if user_id:
         cache_service.sync_invalidate(f"notif_pref:{user_id}")
+
+
+# ==================== API KEY SCOPES MODELS (#1264) ====================
+
+class ApiKeyScope(SQLEnum):
+    """Enumeration of available API key scopes for fine-grained access control."""
+    READ = "read"
+    WRITE = "write"
+    ADMIN = "admin"
+    USERS_READ = "users:read"
+    USERS_WRITE = "users:write"
+    PAYMENTS_READ = "payments:read"
+    PAYMENTS_WRITE = "payments:write"
+    ANALYTICS_READ = "analytics:read"
+    ANALYTICS_WRITE = "analytics:write"
+    EXAMS_READ = "exams:read"
+    EXAMS_WRITE = "exams:write"
+    JOURNAL_READ = "journal:read"
+    JOURNAL_WRITE = "journal:write"
+    SURVEYS_READ = "surveys:read"
+    SURVEYS_WRITE = "surveys:write"
+    NOTIFICATIONS_READ = "notifications:read"
+    NOTIFICATIONS_WRITE = "notifications:write"
+    SETTINGS_READ = "settings:read"
+    SETTINGS_WRITE = "settings:write"
+
+
+class ApiKey(Base):
+    """
+    API Key model for fine-grained access control (#1264).
+
+    Supports scope-based authorization with the principle of least privilege.
+    API keys can have multiple scopes and are associated with users.
+    """
+    __tablename__ = 'api_keys'
+    __table_args__ = (
+        Index('idx_api_key_user', 'user_id'),
+        Index('idx_api_key_key', 'key_hash'),
+        Index('idx_api_key_active', 'is_active'),
+        Index('idx_api_key_created', 'created_at'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    name = Column(String(100), nullable=False)  # Human-readable name for the key
+    key_hash = Column(String(128), unique=True, nullable=False, index=True)  # Hashed API key
+    scopes = Column(JSON, nullable=False)  # List of ApiKeyScope values as strings
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=True)  # Optional expiration date
+    last_used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    # Relationships
+    user = relationship("User")
+
+    def has_scope(self, required_scope: str) -> bool:
+        """Check if this API key has the required scope."""
+        return required_scope in self.scopes
+
+    def has_any_scope(self, required_scopes: list[str]) -> bool:
+        """Check if this API key has any of the required scopes."""
+        return any(scope in self.scopes for scope in required_scopes)
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for API responses (without sensitive data)."""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "name": self.name,
+            "scopes": self.scopes,
+            "is_active": self.is_active,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# Vulnerability Exception Models for SBOM and Security Gate #1266
+class VulnerabilityException(Base):
+    """Model for managing temporary vulnerability exceptions."""
+    __tablename__ = 'vulnerability_exceptions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    package_name = Column(String(255), nullable=False, index=True)
+    package_version = Column(String(100), nullable=False)
+    vulnerability_id = Column(String(100), nullable=False, index=True)  # CVE ID or similar
+    severity = Column(String(50), nullable=False)  # critical, high, medium, low
+    tool_name = Column(String(100), nullable=False)  # safety, bandit, etc.
+
+    # Exception details
+    justification = Column(Text, nullable=False)
+    approved_by = Column(String(255), nullable=False)  # User who approved
+    approved_at = Column(DateTime, default=utc_now, nullable=False)
+    expires_at = Column(DateTime, nullable=False)  # When exception expires
+
+    # Audit fields
+    created_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    # Status
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+
+    # Additional metadata
+    vuln_metadata = Column(JSON, nullable=True)  # Additional vulnerability details
+
+    __table_args__ = (
+        Index('idx_vuln_exception_active', 'is_active', 'expires_at'),
+        Index('idx_vuln_exception_package', 'package_name', 'package_version'),
+    )
+
+    def is_expired(self) -> bool:
+        """Check if the exception has expired."""
+        return utc_now() > self.expires_at
+
+    def is_valid(self) -> bool:
+        """Check if the exception is still valid."""
+        return self.is_active and not self.is_expired()
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for API responses."""
+        return {
+            "id": self.id,
+            "package_name": self.package_name,
+            "package_version": self.package_version,
+            "vulnerability_id": self.vulnerability_id,
+            "severity": self.severity,
+            "tool_name": self.tool_name,
+            "justification": self.justification,
+            "approved_by": self.approved_by,
+            "approved_at": self.approved_at.isoformat() if self.approved_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "is_active": self.is_active,
+            "is_expired": self.is_expired(),
+            "is_valid": self.is_valid(),
+            "metadata": self.vuln_metadata
+        }
+
+
+class SBOMArtifact(Base):
+    """Model for storing SBOM artifacts and metadata."""
+    __tablename__ = 'sbom_artifacts'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    build_id = Column(String(255), nullable=False, index=True)  # CI build identifier
+    commit_sha = Column(String(40), nullable=False, index=True)
+    branch = Column(String(255), nullable=False)
+
+    # SBOM details
+    format = Column(String(50), nullable=False)  # json, xml, etc.
+    spec_version = Column(String(20), nullable=False)  # CycloneDX version
+    component_count = Column(Integer, nullable=False)
+
+    # File storage
+    sbom_path = Column(String(500), nullable=False)  # Path to stored SBOM file
+    checksum = Column(String(128), nullable=False)  # SHA-256 of SBOM file
+
+    # Metadata
+    generated_at = Column(DateTime, default=utc_now, nullable=False)
+    generated_by = Column(String(255), nullable=False)  # CI system or user
+    sbom_metadata = Column(JSON, nullable=True)  # Additional SBOM metadata
+
+    __table_args__ = (
+        Index('idx_sbom_build', 'build_id', 'commit_sha'),
+        Index('idx_sbom_generated', 'generated_at'),
+    )
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for API responses."""
+        return {
+            "id": self.id,
+            "build_id": self.build_id,
+            "commit_sha": self.commit_sha,
+            "branch": self.branch,
+            "format": self.format,
+            "spec_version": self.spec_version,
+            "component_count": self.component_count,
+            "sbom_path": self.sbom_path,
+            "checksum": self.checksum,
+            "generated_at": self.generated_at.isoformat() if self.generated_at else None,
+            "generated_by": self.generated_by,
+            "metadata": self.sbom_metadata
+        }
 

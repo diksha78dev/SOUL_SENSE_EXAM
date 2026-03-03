@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from fastapi import status
 
 from ..schemas import ExamResponseCreate, ExamResultCreate
-from ..models import User, Score, Response, ExamSession, Question
+from ..models import User, Score, Response, UserSession, ExamSession
 from ..exceptions import APIException
 from ..constants.errors import ErrorCode
 from .gamification_service import GamificationService
@@ -30,6 +30,9 @@ except ImportError:
     CRYPTO_AVAILABLE = False
 
 logger = logging.getLogger("api.exam")
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, insert, update
 
 class ExamService:
     """

@@ -61,6 +61,8 @@ class BaseAppSettings(BaseSettings):
     use_pgbouncer: bool = Field(default=False, description="Use PgBouncer for connection pooling")
     pgbouncer_host: str = Field(default="localhost", description="PgBouncer host")
     pgbouncer_port: int = Field(default=6432, description="PgBouncer port")
+    db_request_timeout_seconds: int = Field(default=30, ge=5, le=300, description="Request-scoped DB timeout in seconds")
+    thread_pool_max_workers: int = Field(default=64, ge=8, le=512, description="Default executor max workers for blocking fallbacks")
     @property
     def async_database_url(self) -> str:
         """Construct asynchronous database URL."""
@@ -105,7 +107,41 @@ class BaseAppSettings(BaseSettings):
     redis_db: int = Field(default=0, description="Redis database index")
     redis_connection_url: Optional[str] = Field(default=None, description="Redis URL (if set, overrides individual host/port)")
     redis_ttl_seconds: int = Field(default=60, description="Default lock TTL in seconds")
+    
+    # Celery configuration
+    celery_broker_url: Optional[str] = Field(default=None, description="Celery broker URL")
+    celery_result_backend: Optional[str] = Field(default=None, description="Celery result backend")
+    celery_worker_max_tasks_per_child: int = Field(default=100, ge=1, description="Restart worker children after serving 100 tasks to prevent memory leaks")
 
+    # Database connection pool configuration
+    database_pool_size: int = Field(default=20, ge=1, description="The number of connections to keep open inside the connection pool")
+    database_max_overflow: int = Field(default=10, ge=0, description="The number of connections to allow in connection pool ‘overflow’")
+    database_pool_timeout: int = Field(default=30, ge=0, description="The number of seconds to wait before giving up on getting a connection from the pool")
+    database_pool_recycle: int = Field(default=1800, ge=-1, description="Number of seconds after which a connection is automatically recycled")
+    database_pool_pre_ping: bool = Field(default=True, description="Enable pool pre-ping to handle DB node failures")
+    database_statement_timeout: int = Field(default=30000, ge=0, description="Database statement timeout in milliseconds")
+
+    # Database connection pool configuration
+    database_pool_size: int = Field(default=20, ge=1, description="The number of connections to keep open inside the connection pool")
+    database_max_overflow: int = Field(default=10, ge=0, description="The number of connections to allow in connection pool ‘overflow’")
+    database_pool_timeout: int = Field(default=30, ge=0, description="The number of seconds to wait before giving up on getting a connection from the pool")
+    database_pool_recycle: int = Field(default=1800, ge=-1, description="Number of seconds after which a connection is automatically recycled")
+    database_pool_pre_ping: bool = Field(default=True, description="Enable pool pre-ping to handle DB node failures")
+    database_statement_timeout: int = Field(default=30000, ge=0, description="Database statement timeout in milliseconds")
+    # Database Transient Failure Retry Configuration (Issue #1229)
+    db_retry_max_attempts: int = Field(default=3, ge=1, le=10, description="Maximum retry attempts for transient database errors")
+    db_retry_base_delay_ms: float = Field(default=100.0, ge=10.0, le=5000.0, description="Base delay in milliseconds for exponential backoff")
+    db_retry_jitter_factor: float = Field(default=0.1, ge=0.0, le=1.0, description="Jitter factor (0.0-1.0) to prevent thundering herd behavior")
+    
+    # Payload Size Limits and DoS Protection (Issue #1068)
+    max_request_size_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024, description="Maximum request body size in bytes (default 10MB)")
+    max_json_depth: int = Field(default=20, ge=5, le=100, description="Maximum nesting depth for JSON payloads")
+    max_multipart_parts: int = Field(default=100, ge=1, le=1000, description="Maximum number of parts in multipart/form-data requests")
+    max_multipart_file_size_bytes: int = Field(default=50 * 1024 * 1024, ge=1024, le=500 * 1024 * 1024, description="Maximum file size for multipart uploads (default 50MB)")
+    max_array_size: int = Field(default=10000, ge=100, le=100000, description="Maximum number of elements in a JSON array")
+    max_object_keys: int = Field(default=1000, ge=10, le=10000, description="Maximum number of keys in a JSON object")
+    enable_compression_bomb_check: bool = Field(default=True, description="Enable detection of compression bombs (zip/gzip)")
+    compression_bomb_ratio: float = Field(default=10.0, ge=1.0, le=100.0, description="Compression ratio threshold for bomb detection (compressed:uncompressed)")
     # Deletion Grace Period
     deletion_grace_period_days: int = Field(default=30, ge=0, description="Grace period for account deletion in days")
 
