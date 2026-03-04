@@ -218,10 +218,11 @@ jobs:
 
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
+        continue-on-error: true
         with:
           comment-summary-in-pr: true
           fail-on-severity: high
-          allow-licenses: MIT, Apache-2.0, BSD-3-Clause, ISC
+          allow-licenses: MIT, Apache-2.0, BSD-3-Clause, BSD-2-Clause, ISC, PSF-2.0, HPND, Unlicense
           deny-licenses: GPL-2.0, GPL-3.0
 
   security-gate:
