@@ -88,6 +88,19 @@ EXPERIMENTAL_FLAGS: Dict[str, FeatureFlag] = {
         description="Enable native macOS Keychain integration for secure local secrets storage",
         experimental=True,
         category="security"
+    "migration_blast_radius": FeatureFlag(
+        name="migration_blast_radius",
+        default=False,
+        description="Enable migration blast radius pre-approval checklist validation",
+        experimental=True,
+        category="infra"
+    ),
+    "capacity_headroom_forecasting": FeatureFlag(
+        name="capacity_headroom_forecasting",
+        default=False,
+        description="Enable capacity headroom forecasting for peak windows",
+        experimental=True,
+        category="infra"
     ),
 }
 
