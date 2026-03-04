@@ -551,6 +551,7 @@ class UserSettingsCreate(BaseModel):
     data_usage_consent: bool = False
     emergency_disclaimer_accepted: bool = False
     crisis_support_preference: bool = True
+    onboarding_completed: bool = False
     crisis_mode_enabled: bool = False  # Enable crisis intervention routing (Issue #930)
     
     # Data Usage Consent (Issue #929)
@@ -578,6 +579,7 @@ class UserSettingsUpdate(BaseModel):
     data_usage_consent: Optional[bool] = None
     emergency_disclaimer_accepted: Optional[bool] = None
     crisis_support_preference: Optional[bool] = None
+    onboarding_completed: Optional[bool] = None
     crisis_mode_enabled: Optional[bool] = None  # Enable crisis intervention routing (Issue #930)
     
     # Data Usage Consent (Issue #929)
@@ -604,6 +606,10 @@ class UserSettingsResponse(BaseModel):
     advice_boundaries: Optional[List[str]] = None
     ai_trust_level: Optional[int] = None
     
+    data_usage_consent: bool
+    emergency_disclaimer_accepted: bool
+    crisis_support_preference: bool
+    onboarding_completed: bool
     data_usage_consent: Optional[bool] = None
     emergency_disclaimer_accepted: Optional[bool] = None
     crisis_support_preference: Optional[bool] = None
