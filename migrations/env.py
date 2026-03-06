@@ -15,6 +15,13 @@ try:
 except ImportError:
     CHECKSUM_REGISTRY_AVAILABLE = False
 
+# Import online index policy guard
+try:
+    from app.infra.online_index_policy import validate_index_in_migration
+    INDEX_POLICY_AVAILABLE = True
+except ImportError:
+    INDEX_POLICY_AVAILABLE = False
+
 # Import your models
 try:
     from backend.fastapi.api.models import Base
@@ -66,11 +73,40 @@ def verify_migration_integrity() -> None:
         log.warning(f"Migration integrity check skipped: {e}")
 
 
+def log_index_policy_info(database_url: str) -> None:
+    """Log index policy information for the target database."""
+    if not INDEX_POLICY_AVAILABLE:
+        return
+    
+    try:
+        import logging
+        log = logging.getLogger(__name__)
+        
+        # Detect database type from URL
+        if 'postgresql' in database_url or 'postgres' in database_url:
+            db_type = 'postgresql'
+            msg = "Index Policy: PostgreSQL - using CREATE INDEX CONCURRENTLY for online creation"
+        elif 'mysql' in database_url:
+            db_type = 'mysql'
+            msg = "Index Policy: MySQL - using ALGORITHM=INPLACE, LOCK=NONE for online creation"
+        elif 'sqlite' in database_url:
+            db_type = 'sqlite'
+            msg = "Index Policy: SQLite - full table lock during CREATE INDEX (schedule maintenance window)"
+        else:
+            return
+        
+        log.info(f"✓ {msg}")
+    except Exception:
+        pass  # Graceful degradation
+
+
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""
     verify_migration_integrity()
     
     url = DATABASE_URL # Use app config
+    log_index_policy_info(url)
+    
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -106,6 +142,9 @@ def run_migrations_online() -> None:
     else:
         # It's the default, so use App Config
         target_url = DATABASE_URL
+    
+    # Log index policy information for target database
+    log_index_policy_info(target_url)
         
     from sqlalchemy import create_engine
     connect_args = {}
