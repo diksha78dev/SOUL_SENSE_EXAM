@@ -1,0 +1,83 @@
+# serializer version: 1
+# name: test_health_snapshot
+  dict({
+    'details': None,
+    'services': None,
+    'status': 'healthy',
+    'timestamp': 'REDACTED_TIMESTAMP',
+    'version': '1.0.0',
+  })
+# ---
+# name: test_root_snapshot
+  dict({
+    'documentation': '/docs',
+    'name': 'SoulSense API',
+    'versions': list([
+      dict({
+        'path': '/api/v1',
+        'status': 'current',
+        'version': 'v1',
+      }),
+    ]),
+  })
+# ---
+# name: test_v1_assessment_stats_snapshot
+  dict({
+    'age_group_distribution': dict({
+      'Young Adult': 1,
+    }),
+    'average_score': 85.0,
+    'average_sentiment': 0.75,
+    'highest_score': 85,
+    'lowest_score': 85,
+    'total_assessments': 1,
+  })
+# ---
+# name: test_v1_categories_snapshot
+  list([
+    dict({
+      'id': 1,
+      'name': 'Emotional Intelligence',
+    }),
+  ])
+# ---
+# name: test_v1_health_snapshot
+  dict({
+    'details': None,
+    'services': None,
+    'status': 'healthy',
+    'timestamp': 'REDACTED_TIMESTAMP',
+    'version': '1.0.0',
+  })
+# ---
+# name: test_v1_questions_snapshot
+  dict({
+    'page': 1,
+    'page_size': 5,
+    'questions': list([
+      dict({
+        'category_id': 1,
+        'difficulty': None,
+        'id': 1,
+        'is_active': 1,
+        'max_age': 100,
+        'min_age': 10,
+        'question_text': 'How do you feel today?',
+        'tooltip': None,
+        'weight': 1.0,
+      }),
+      dict({
+        'category_id': 1,
+        'difficulty': None,
+        'id': 2,
+        'is_active': 1,
+        'max_age': 100,
+        'min_age': 18,
+        'question_text': 'Do you like testing?',
+        'tooltip': None,
+        'weight': 1.0,
+      }),
+    ]),
+    'total': 2,
+  })
+# ---

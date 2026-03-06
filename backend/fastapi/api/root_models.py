@@ -43,6 +43,7 @@ UserEmotionalPatterns = _models_module.UserEmotionalPatterns
 UserSyncSetting = _models_module.UserSyncSetting
 LoginAttempt = _models_module.LoginAttempt
 RefreshToken = _models_module.RefreshToken
+AuditLog = _models_module.AuditLog
 Goal = _models_module.Goal
 AnalyticsEvent = _models_module.AnalyticsEvent
 OTP = _models_module.OTP
@@ -78,6 +79,7 @@ __all__ = [
     'UserSyncSetting',
     'LoginAttempt',
     'RefreshToken',
+    'AuditLog',
     'Goal',
     'AnalyticsEvent',
     'OTP',

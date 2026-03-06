@@ -145,6 +145,7 @@ jobs:
             exit 1
           fi
 
+          pytest -c pytest.ini tests/unit/ tests/integration/test_response_snapshots.py
           pytest -c pytest.ini tests/unit/
 
           echo "Validating security headers..."

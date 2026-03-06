@@ -22,6 +22,16 @@ from ..config import get_settings
 from ..constants.errors import ErrorCode
 from ..constants.security_constants import BCRYPT_ROUNDS, REFRESH_TOKEN_EXPIRE_DAYS
 from ..exceptions import AuthException
+from .audit_service import AuditService
+
+
+settings = get_settings()
+logger = logging.getLogger("api.auth")
+
+class AuthService:
+    """Service for handling authentication and session management (Async)."""
+    
+    def __init__(self, db: AsyncSession = Depends(get_db)):
 from sqlalchemy import select, update, delete, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import OperationalError
@@ -150,6 +160,8 @@ class AuthService:
             await self._record_login_attempt(identifier_lower, False, ip_address, reason="User not found")
             logger.warning(f"Login failed: User not found {identifier_lower}")
             # Dummy verify to consume time
+            self.verify_password("dummy", "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW")
+            await self._record_login_attempt(identifier_lower, False, ip_address)
             verify_password("dummy", "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW")
             await self._record_login_attempt(identifier_lower, False, ip_address, reason="User not found")
             raise AuthException(
@@ -157,6 +169,9 @@ class AuthService:
                 message="Incorrect username or password"
             )
 
+        # 5. Verify password
+        if not self.verify_password(password, user.password_hash):
+            await self._record_login_attempt(identifier_lower, False, ip_address)
         if not await self.verify_password(password, user.password_hash):
             await self._record_login_attempt(identifier_lower, False, ip_address, reason="Invalid password")
             logger.warning(f"Login failed: Invalid password {identifier_lower}")
@@ -167,6 +182,10 @@ class AuthService:
                 code=ErrorCode.AUTH_INVALID_CREDENTIALS,
                 message="Incorrect username or password"
             )
+        
+        # 6. Success - Update last login & Audit
+        await self._record_login_attempt(identifier_lower, True, ip_address)
+        await self.update_last_login(user.id)
         
         # 6.1 Legacy Password Migration (Issue #996)
         # If password was stored in plain text, migrate it to a hash now
@@ -260,6 +279,24 @@ class AuthService:
         if email and code:
             EmailService.send_otp(email, code, "Login Verification")
             await self.db.commit()
+
+    async def initiate_2fa_login(self, user: User) -> str:
+        """Generate OTP and return pre_auth token (Async)."""
+        from .otp_manager import OTPManager
+        from .email_service import EmailService
+        
+        code, _ = await OTPManager.generate_otp(user.id, "LOGIN_CHALLENGE", db_session=self.db)
+        
+        email = None
+        stmt = select(PersonalProfile).filter(PersonalProfile.user_id == user.id)
+        result = await self.db.execute(stmt)
+        profile = result.scalar_one_or_none()
+        if profile:
+            email = profile.email
+            
+        if email and code:
+            EmailService.send_otp(email, code, "Login Verification")
+            await self.db.commit()
         jti = str(uuid.uuid4())
         # Ensure tid is a string for JWT encoding
         tid = to_encode.get("tid")
@@ -321,6 +358,7 @@ class AuthService:
         from .otp_manager import OTPManager
         
         try:
+            # 1. Verify Token
             payload = jwt.decode(pre_auth_token, settings.SECRET_KEY, algorithms=[settings.jwt_algorithm])
             user_id = payload.get("sub")
             if not user_id or payload.get("scope") != "pre_auth":
@@ -330,6 +368,17 @@ class AuthService:
             success, msg = await OTPManager.verify_otp(user_id_int, code, "LOGIN_CHALLENGE", db_session=self.db)
             if not success:
                  raise AuthException(code=ErrorCode.AUTH_INVALID_CREDENTIALS, message=msg)
+                 
+            stmt = select(User).filter(User.id == user_id_int)
+            result = await self.db.execute(stmt)
+            user = result.scalar_one_or_none()
+            if not user:
+                 raise AuthException(code=ErrorCode.AUTH_USER_NOT_FOUND, message="User not found")
+                 
+            await self._record_login_attempt(user.username, True, ip_address)
+            await self.update_last_login(user.id)
+            await AuditService.log_event(user.id, "LOGIN_2FA", ip_address=ip_address, details={"method": "2fa", "status": "success"}, db_session=self.db)
+            
                  
             stmt = select(User).filter(User.id == user_id_int)
             result = await self.db.execute(stmt)
@@ -449,6 +498,7 @@ class AuthService:
             await self.db.rollback()
             logger.error(f"Failed to update last_login: {e}")
 
+    async def _record_login_attempt(self, username: str, success: bool, ip_address: str):
     async def _is_account_locked(self, username: str) -> Tuple[bool, Optional[str], int]:
         """Check progressive lockout (Async)."""
         thirty_mins_ago = datetime.now(timezone.utc) - timedelta(minutes=30)
@@ -499,6 +549,7 @@ class AuthService:
             await self.db.rollback()
             logger.error(f"Failed to record login attempt: {e}")
 
+    async def register_user(self, user_data: 'UserCreate') -> User:
     async def register_user(self, user_data: 'UserCreate') -> Tuple[bool, Optional[User], str]:
         """
         Register a new user and their personal profile.
@@ -532,6 +583,15 @@ class AuthService:
             logger.info(f"Registration attempt for existing identity: {username_lower}")
             return True, None, "Account creation initiated. Check email."
 
+        # 3. Disposable Email Check
+        from .security_service import SecurityService
+        if SecurityService.is_disposable_email(email_lower):
+            raise APIException(
+                code=ErrorCode.REG_DISPOSABLE_EMAIL,
+                message="Registration with disposable email domains is not allowed",
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+
         try:
             hashed_pw = await self.hash_password(user_data.password)
             
@@ -545,6 +605,10 @@ class AuthService:
                 age=user_data.age, gender=user_data.gender
             )
             self.db.add(new_profile)
+            
+            await self.db.commit()
+            self.db.refresh(new_user)
+            return new_user
             await self.db.commit()
             await self.db.refresh(new_user)
 
@@ -555,6 +619,9 @@ class AuthService:
             return False, None, "Internal error."
 
     async def create_refresh_token(self, user_id: int) -> str:
+        """
+        Generate a secure refresh token, hash it, and store it in the DB.
+        """
         """Create refresh token (Async)."""
         try:
             # 1. Validation (Does NOT leak existence if we return generic later)
@@ -674,6 +741,9 @@ class AuthService:
 
     async def revoke_refresh_token(self, refresh_token: str) -> None:
         """Revoke refresh token (Async)."""
+
+    async def revoke_refresh_token(self, refresh_token: str) -> None:
+        """Revoke refresh token (Async)."""
         if commit:
             await self.db.commit()
         return token
@@ -759,6 +829,7 @@ class AuthService:
         """Revoke access token (Async)."""
         from jose import jwt
         from ..root_models import TokenRevocation
+        try:
     async def revoke_access_token(self, token: str) -> None:
         """Revoke an access token by adding it to the Redis blacklist."""
         try:
@@ -868,6 +939,12 @@ class AuthService:
             if not profile:
                 return True, GENERIC_SUCCESS_MSG
 
+            code, error = await OTPManager.generate_otp(user.id, "RESET_PASSWORD", db_session=self.db)
+            if not code:
+                return False, error or "Too many requests."
+                
+            background_tasks.add_task(EmailService.send_otp, email_lower, code, "Password Reset")
+            return True, "If an account exists, email sent."
             user_stmt = select(User).filter(User.id == profile.user_id)
             user_res = await self.db.execute(user_stmt)
             user = user_res.scalar_one_or_none()
@@ -882,10 +959,78 @@ class AuthService:
             background_tasks.add_task(EmailService.send_otp, email_lower, code, "Password Reset")
             return True, GENERIC_SUCCESS_MSG
         except Exception as e:
-            logger.error(f"Error in initiate_password_reset: {e}")
-            return False, "An error occurred. Please try again."
+            logger.error(f"Reset Error: {e}")
+            return False, "An error occurred."
 
     async def complete_password_reset(self, email: str, otp_code: str, new_password: str) -> tuple[bool, str]:
+        """Complete password reset (Async)."""
+        from .otp_manager import OTPManager
+        
+        try:
+            email_lower = email.lower().strip()
+            stmt_p = select(PersonalProfile).filter(PersonalProfile.email == email_lower)
+            res_p = await self.db.execute(stmt_p)
+            profile = res_p.scalar_one_or_none()
+            if not profile: return False, "Invalid request."
+            
+            stmt_u = select(User).filter(User.id == profile.user_id)
+            res_u = await self.db.execute(stmt_u)
+            user = res_u.scalar_one_or_none()
+            if not user: return False, "Invalid request."
+                
+            success, msg = await OTPManager.verify_otp(user.id, otp_code, "RESET_PASSWORD", db_session=self.db)
+            if not success: return False, msg
+            
+            user.password_hash = await self.hash_password(new_password)
+            await self.db.execute(update(RefreshToken).filter(RefreshToken.user_id == user.id).values(is_revoked=True))
+            await self.db.commit()
+            return True, "Password reset successfully."
+        except Exception as e:
+            await self.db.rollback()
+            return False, f"Internal error: {str(e)}"
+
+    async def send_2fa_setup_otp(self, user: User) -> bool:
+        """Generate and send OTP for 2FA setup (Async)."""
+        from .otp_manager import OTPManager
+        from .email_service import EmailService
+        
+        code, _ = await OTPManager.generate_otp(user.id, "2FA_SETUP", db_session=self.db)
+        if not code:
+            return False
+            
+        email = None
+        stmt = select(PersonalProfile).filter(PersonalProfile.user_id == user.id)
+        result = await self.db.execute(stmt)
+        profile = result.scalar_one_or_none()
+        if profile:
+            email = profile.email
+            
+        if email:
+             EmailService.send_otp(email, code, "Enable 2FA")
+             await self.db.commit()
+             return True
+        return False
+
+    async def enable_2fa(self, user_id: int, code: str) -> bool:
+        """Verify code and enable 2FA (Async)."""
+        from .otp_manager import OTPManager
+        
+        success, _ = await OTPManager.verify_otp(user_id, code, "2FA_SETUP", db_session=self.db)
+        if success:
+            stmt = update(User).where(User.id == user_id).values(is_2fa_enabled=True)
+            await self.db.execute(stmt)
+            await self.db.commit()
+            return True
+        return False
+
+    async def disable_2fa(self, user_id: int) -> bool:
+        """Disable 2FA for user (Async)."""
+        stmt = update(User).where(User.id == user_id).values(is_2fa_enabled=False)
+        await self.db.execute(stmt)
+        await self.db.commit()
+        return True
+
+
         """Complete password reset flow."""
         from .otp_manager import OTPManager
         from ..utils.weak_passwords import WEAK_PASSWORDS
