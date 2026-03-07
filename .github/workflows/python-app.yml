@@ -96,6 +96,39 @@ jobs:
           pytest tests/ -m "serial" --maxfail=5 --timeout=180 -v \
             --cov=app --cov=backend --cov-report=term-missing --cov-report=html:htmlcov --cov-append
 
+      - name: Cache Correctness Verification (Issue #1434)
+        timeout-minutes: 10
+        run: |
+          # Run cache verifier unit tests
+          pytest tests/unit/test_cache_correctness_verifier.py -v --tb=short
+          
+          # Generate verification report
+          python -c "
+          import json
+          import asyncio
+          from backend.fastapi.api.services.cache_service import CacheService
+          from backend.fastapi.api.services.cache_correctness_verifier import run_cache_verification
+          
+          async def verify():
+            service = CacheService()
+            try:
+              await service.connect()
+              report = await run_cache_verification(service)
+              
+              with open('cache-verification-report.json', 'w') as f:
+                json.dump(report, f, indent=2)
+              
+              print(f'✓ Cache Verification: {report[\"passed\"]}/{report[\"total_checks\"]} checks passed')
+              if not report['success']:
+                print('❌ Cache verification failed')
+                exit(1)
+            finally:
+              if service.redis:
+                await service.redis.close()
+          
+          asyncio.run(verify())
+          "
+
       - name: Test Backend App
         timeout-minutes: 10
         run: |
@@ -141,6 +174,14 @@ jobs:
         with:
           name: coverage-report-${{ github.sha }}
           path: htmlcov
+          retention-days: 30
+
+      - name: Upload Cache Verification Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-verification-report-${{ github.sha }}
+          path: cache-verification-report.json
           retention-days: 30
 
       - name: Test Environment Fidelity (Issue #1315)
