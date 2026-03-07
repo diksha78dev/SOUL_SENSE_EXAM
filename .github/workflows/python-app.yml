@@ -118,25 +118,39 @@ jobs:
           pytest tests/ -m "serial" --maxfail=5 --timeout=180 -v \
             --cov=app --cov=backend --cov-report=term-missing --cov-report=html:htmlcov --cov-append
 
-      - name: Detect Flaky Tests
-        if: always()
-        continue-on-error: true
-        timeout-minutes: 15
+      - name: Cache Correctness Verification (Issue #1434)
+        timeout-minutes: 10
         run: |
-          echo "🧪 Running flaky test detection..."
-          python scripts/flaky_test_runner.py --count 2 --output flaky_test_report.json
+          # Run cache verifier unit tests
+          pytest tests/unit/test_cache_correctness_verifier.py -v --tb=short
           
-          # Show report summary
-          echo "📊 Flaky Test Report:"
-          python -c "import json; data = json.load(open('flaky_test_report.json')); print(f\"Total flaky tests: {data.get('total_flaky', 0)}\")"
+          # Generate verification report
+          python -c "
+          import json
+          import asyncio
+          from backend.fastapi.api.services.cache_service import CacheService
+          from backend.fastapi.api.services.cache_correctness_verifier import run_cache_verification
+          
+          async def verify():
+            service = CacheService()
+            try:
+              await service.connect()
+              report = await run_cache_verification(service)
+              
+              with open('cache-verification-report.json', 'w') as f:
+                json.dump(report, f, indent=2)
+              
+              print(f'✓ Cache Verification: {report[\"passed\"]}/{report[\"total_checks\"]} checks passed')
+              if not report['success']:
+                print('❌ Cache verification failed')
+                exit(1)
+            finally:
+              if service.redis:
+                await service.redis.close()
+          
+          asyncio.run(verify())
+          "
 
-      - name: Upload Flaky Test Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: flaky-test-report-${{ github.sha }}
-          path: flaky_test_report.json
-          retention-days: 90
       - name: Test Backend App
         timeout-minutes: 10
         if: ${{ needs.detect-changes.outputs.run_all == 'true' || contains('["backend", "all"]', needs.detect-changes.outputs.modules) }}
@@ -183,6 +197,14 @@ jobs:
         with:
           name: coverage-report-${{ github.sha }}
           path: htmlcov
+          retention-days: 30
+
+      - name: Upload Cache Verification Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-verification-report-${{ github.sha }}
+          path: cache-verification-report.json
           retention-days: 30
 
       - name: Test Environment Fidelity (Issue #1315)
