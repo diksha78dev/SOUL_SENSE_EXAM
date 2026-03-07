@@ -49,6 +49,13 @@ try:
 except ImportError:
     ROLLBACK_REHEARSAL_AVAILABLE = False
 
+# Import data contract deprecation tracker
+try:
+    from app.infra.data_contract_deprecation import DataContractDeprecationTracker
+    DEPRECATION_TRACKER_AVAILABLE = True
+except ImportError:
+    DEPRECATION_TRACKER_AVAILABLE = False
+
 # Import your models
 try:
     from backend.fastapi.api.models import Base
@@ -181,6 +188,27 @@ def log_rollback_rehearsal_status() -> None:
         pass  # Graceful degradation
 
 
+def log_deprecation_tracker_status() -> None:
+    """Log data contract deprecation tracker status."""
+    if not DEPRECATION_TRACKER_AVAILABLE:
+        return
+    
+    try:
+        import logging
+        log = logging.getLogger(__name__)
+        
+        migrations_dir = os.path.dirname(os.path.abspath(__file__))
+        tracker = DataContractDeprecationTracker(registry_dir=migrations_dir)
+        report = tracker.generate_compatibility_report()
+        
+        if report["reminders_30_day"]:
+            log.warning(f"⚠ {len(report['reminders_30_day'])} deprecation warnings (30 days or less)")
+        
+        log.info(f"✓ Data Contract Deprecation Tracker: {report['total_contracts']} contracts active")
+    except Exception:
+        pass  # Graceful degradation
+
+
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""
     verify_migration_integrity()
@@ -191,6 +219,7 @@ def run_migrations_offline() -> None:
     log_cross_region_sequencer_status()
     log_shadow_table_validator_status()
     log_rollback_rehearsal_status()
+    log_deprecation_tracker_status()
     
     context.configure(
         url=url,
@@ -234,6 +263,7 @@ def run_migrations_online() -> None:
     log_cross_region_sequencer_status()
     log_shadow_table_validator_status()
     log_rollback_rehearsal_status()
+    log_deprecation_tracker_status()
         
     from sqlalchemy import create_engine
     connect_args = {}
