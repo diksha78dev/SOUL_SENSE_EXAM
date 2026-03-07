@@ -1709,6 +1709,11 @@ class GoalResponse(GoalBase):
     model_config = ConfigDict(from_attributes=True)
 
 class GoalListResponse(BaseModel):
+    """Schema for listing goals."""
+    goals: list[GoalResponse]
+    total: int
+    model_config = ConfigDict(from_attributes=True)
+
 # ============================================================================
 # Gamification Schemas
 # ============================================================================
